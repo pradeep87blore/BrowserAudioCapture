@@ -7,6 +7,10 @@
 </head>
 <body>
   <div class="chrome">
+    <div class="row tabs-row">
+      <div id="tabs" class="tabs"></div>
+      <button id="new-tab" class="icon-btn" type="button" aria-label="New tab" title="New tab (Ctrl+T)">+</button>
+    </div>
     <div class="row">
       <button id="back" class="icon-btn" type="button" aria-label="Back" title="Back (Alt+Left)" disabled>←</button>
       <button id="forward" class="icon-btn" type="button" aria-label="Forward" title="Forward (Alt+Right)" disabled>→</button>
@@ -36,6 +40,7 @@
         <span class="switch-label">Stop after 1 min silence</span>
       </label>
       <button id="folder" class="text-btn" type="button">Open folder</button>
+      <button id="downloads" class="text-btn" type="button" title="Show this tab's latest download, or open the downloads folder">Downloads</button>
     </div>
   </div>
   <script src="renderer.js"></script>

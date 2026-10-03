@@ -15,6 +15,16 @@ npm start
 
 Recordings are saved in the `captured` folder in this project.
 
+## Tabs
+
+Each tab opens its own site. Switching tabs does not stop a recording that is already running.
+
+- **Record** on the toolbar, **F9**, or the dot on a tab records that tab only. Several tabs can record at the same time, each to its own WAV file.
+- **Downloads** saves files the page itself downloads into the `downloads` folder, separate for each tab. The arrow on a tab shows that tab's latest download.
+- Mute applies to the tab you are looking at. Other tabs keep their own mute setting.
+
+Ctrl+T opens a tab, Ctrl+W closes the current tab, and Ctrl+Tab switches tabs. Closing a tab that is recording saves that take and leaves the other tabs alone.
+
 ## Record
 
 1. Enter a site in the address bar and log in.
@@ -40,7 +50,10 @@ The recorded level follows the volume inside the website, such as the player's o
 
 | Key | Action |
 | --- | --- |
-| F9 | Start or stop recording |
+| F9 | Start or stop recording for the current tab |
+| Ctrl+T | New tab |
+| Ctrl+W | Close the current tab |
+| Ctrl+Tab | Next tab |
 | Ctrl+L | Focus the address bar |
 | Alt+Left / Alt+Right | Back / forward |
 | Enter in the address bar | Open the address, or search if it is not a URL |

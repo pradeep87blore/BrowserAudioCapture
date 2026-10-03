@@ -1,11 +1,10 @@
-const { app, BaseWindow, WebContentsView, session, dialog, ipcMain, shell, protocol, webContents } = require('electron')
+const { app, BaseWindow, WebContentsView, session, dialog, ipcMain, shell, protocol } = require('electron')
 const fs = require('fs')
 const path = require('path')
-const { pathToFileURL } = require('url')
 const wav = require('./lib/wav')
 
 const PARTITION = 'persist:browser'
-const CHROME_HEIGHT = 104
+const CHROME_HEIGHT = 136
 const SELF_TEST = process.argv.includes('--self-test')
 const COOKIE_CHECK = process.argv.includes('--self-test-cookies')
 
@@ -34,9 +33,15 @@ let win = null
 let chromeView = null
 let browserView = null
 let browserSession = null
-let capture = null
+let activeTabId = null
+let tabSeq = 1
+const tabs = new Map()
+const captures = new Map()
+const captureQueue = []
+const pendingClose = new Set()
 let recordingFinished = null
 let captureDir = ''
+let downloadDir = ''
 let settingsPath = ''
 let closeAfterSave = false
 let quitting = false
@@ -44,6 +49,10 @@ let outputMuted = false
 
 function captureDirectory() {
   return path.join(__dirname, 'captured')
+}
+
+function downloadDirectory() {
+  return path.join(__dirname, 'downloads')
 }
 
 function loadSettings() {
@@ -70,16 +79,28 @@ function cleanupTemps() {
   if (!fs.existsSync(captureDir)) return
   for (const name of fs.readdirSync(captureDir)) {
     if (name.startsWith('.recording-') && name.endsWith('.f32')) {
-      fs.rmSync(path.join(captureDir, name), { force: true })
+      const full = path.join(captureDir, name)
+      const age = Date.now() - fs.statSync(full).mtimeMs
+      if (age > 15000) fs.rmSync(full, { force: true })
     }
   }
 }
 
-function browserFrame() {
-  const contents = browserView && browserView.webContents
-  if (!contents || contents.isDestroyed()) return null
+function activeTab() {
+  return tabs.get(activeTabId) || null
+}
+
+function tabByContents(contents) {
+  for (const tab of tabs.values()) {
+    if (tab.view.webContents === contents) return tab
+  }
+  return null
+}
+
+function browserFrameFor(tab) {
+  if (!tab || tab.view.webContents.isDestroyed()) return null
   try {
-    return contents.mainFrame
+    return tab.view.webContents.mainFrame
   } catch {
     return null
   }
@@ -91,30 +112,70 @@ function displayUrl(url) {
   return url
 }
 
-function sendNav() {
-  if (!chromeView || chromeView.webContents.isDestroyed() || !browserView) return
-  const contents = browserView.webContents
-  if (contents.isDestroyed()) return
-  chromeView.webContents.send('nav-updated', {
-    url: displayUrl(contents.getURL()),
-    loading: contents.isLoading(),
-    canGoBack: contents.navigationHistory.canGoBack(),
-    canGoForward: contents.navigationHistory.canGoForward(),
+function sendToChrome(channel, payload) {
+  if (!chromeView || chromeView.webContents.isDestroyed()) return
+  chromeView.webContents.send(channel, payload)
+}
+
+function tabSummary(tab) {
+  const contents = tab.view.webContents
+  const alive = !contents.isDestroyed()
+  return {
+    id: tab.id,
+    title: tab.title || 'New tab',
+    url: alive ? displayUrl(contents.getURL()) : '',
+    loading: alive && contents.isLoading(),
+    canGoBack: alive && contents.navigationHistory.canGoBack(),
+    canGoForward: alive && contents.navigationHistory.canGoForward(),
+    recording: captures.has(tab.id),
+    muted: !!tab.muted,
+    lastDownload: tab.lastDownload ? path.basename(tab.lastDownload) : '',
+  }
+}
+
+function sendTabs() {
+  sendToChrome('tabs-updated', {
+    tabs: [...tabs.values()].map(tabSummary),
+    activeId: activeTabId,
   })
 }
 
 function layout() {
-  if (!win || win.isDestroyed()) return
+  if (!win || win.isDestroyed() || !chromeView) return
   const bounds = win.getContentBounds()
   const width = Math.max(0, bounds.width)
   const height = Math.max(0, bounds.height)
   chromeView.setBounds({ x: 0, y: 0, width, height: Math.min(CHROME_HEIGHT, height) })
-  browserView.setBounds({
+  const pageBounds = {
     x: 0,
     y: CHROME_HEIGHT,
     width,
     height: Math.max(0, height - CHROME_HEIGHT),
-  })
+  }
+  for (const tab of tabs.values()) {
+    tab.view.setBounds(pageBounds)
+    tab.view.setVisible(tab.id === activeTabId)
+  }
+}
+
+function selectTab(id) {
+  if (!tabs.has(id)) return
+  activeTabId = id
+  browserView = tabs.get(id).view
+  layout()
+  const tab = tabs.get(id)
+  if (win && !win.isDestroyed()) {
+    const title = tab.title && tab.title !== 'New tab' ? `${tab.title} — Browser Audio Capture` : 'Browser Audio Capture'
+    win.setTitle(title)
+  }
+  sendTabs()
+}
+
+function cycleTab(direction) {
+  const ids = [...tabs.keys()]
+  const index = ids.indexOf(activeTabId)
+  if (index < 0 || ids.length < 2) return
+  selectTab(ids[(index + direction + ids.length) % ids.length])
 }
 
 function normalizeAddress(input) {
@@ -188,17 +249,19 @@ function popupOptions() {
   }
 }
 
-function applyOutputMute() {
-  for (const contents of webContents.getAllWebContents()) {
-    if (contents.isDestroyed() || !browserSession || contents.session !== browserSession) continue
-    contents.setAudioMuted(outputMuted)
-  }
+function safeFileName(name) {
+  const cleaned = String(name || 'download').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/^\.+/, '').slice(0, 80)
+  return cleaned || 'download'
+}
+
+function applyTabMute(tab) {
+  if (!tab || tab.view.webContents.isDestroyed()) return
+  tab.view.webContents.setAudioMuted(!!tab.muted)
 }
 
 function registerBrowserContents(contents) {
   if (!browserSession || contents.session !== browserSession) return
   contents.setBackgroundThrottling(false)
-  contents.setAudioMuted(outputMuted)
   contents.setWindowOpenHandler(() => ({
     action: 'allow',
     overrideBrowserWindowOptions: popupOptions(),
@@ -230,74 +293,264 @@ function installAppProtocol() {
   })
 }
 
+function attachTab(tab) {
+  const contents = tab.view.webContents
+  const refresh = () => {
+    if (tab.id === activeTabId) {
+      const url = contents.isDestroyed() ? '' : contents.getURL()
+      if (/^https?:\/\//i.test(url)) rememberUrl(url)
+    }
+    sendTabs()
+  }
+  contents.on('did-start-loading', sendTabs)
+  contents.on('did-stop-loading', sendTabs)
+  contents.on('did-navigate', refresh)
+  contents.on('did-navigate-in-page', refresh)
+  contents.on('page-title-updated', (_event, title) => {
+    tab.title = !title || title === 'Start' ? 'New tab' : title
+    if (tab.id === activeTabId && win && !win.isDestroyed()) {
+      win.setTitle(tab.title === 'New tab' ? 'Browser Audio Capture' : `${tab.title} — Browser Audio Capture`)
+    }
+    sendTabs()
+  })
+  contents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return
+    const key = String(input.key || '').toLowerCase()
+    if (input.alt && input.key === 'Left') {
+      event.preventDefault()
+      if (contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack()
+    } else if (input.alt && input.key === 'Right') {
+      event.preventDefault()
+      if (contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward()
+    } else if (input.control && key === 't' && !input.shift) {
+      event.preventDefault()
+      void createTab({ blank: true })
+    } else if (input.control && key === 'w') {
+      event.preventDefault()
+      requestClose(tab.id)
+    } else if (input.control && input.key === 'Tab') {
+      event.preventDefault()
+      cycleTab(input.shift ? -1 : 1)
+    } else if (input.control && key === 'l') {
+      event.preventDefault()
+      chromeView.webContents.focus()
+      chromeView.webContents.send('focus-url')
+    } else if (input.key === 'F9') {
+      event.preventDefault()
+      chromeView.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'F9' })
+      chromeView.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'F9' })
+    }
+  })
+}
+
+async function createTab(options = {}) {
+  const id = tabSeq++
+  const view = new WebContentsView({
+    webPreferences: {
+      partition: PARTITION,
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      backgroundThrottling: false,
+    },
+  })
+  view.setBackgroundColor('#12141a')
+  const tab = {
+    id,
+    view,
+    title: 'New tab',
+    muted: outputMuted,
+    lastDownload: '',
+  }
+  tabs.set(id, tab)
+  win.contentView.addChildView(view)
+  view.webContents.setBackgroundThrottling(false)
+  applyTabMute(tab)
+  attachTab(tab)
+  selectTab(id)
+  const settings = loadSettings()
+  try {
+    if (options.file) await view.webContents.loadFile(options.file)
+    else if (options.url) await view.webContents.loadURL(options.url)
+    else if (!options.blank && tabs.size === 1 && /^https?:\/\//i.test(settings.lastUrl)) await view.webContents.loadURL(settings.lastUrl)
+    else await view.webContents.loadFile(path.join(__dirname, 'src', 'start.html'))
+  } catch (error) {
+    console.error(error)
+  }
+  sendTabs()
+  return tab
+}
+
+function destroyTab(tabId) {
+  const tab = tabs.get(tabId)
+  if (!tab || captures.has(tabId)) return
+  tabs.delete(tabId)
+  pendingClose.delete(tabId)
+  try {
+    win.contentView.removeChildView(tab.view)
+  } catch {}
+  if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close()
+  if (tabs.size === 0) {
+    void createTab({ blank: true })
+    return
+  }
+  if (activeTabId === tabId) selectTab([...tabs.keys()].pop())
+  else sendTabs()
+}
+
+function requestClose(tabId) {
+  if (!tabs.has(tabId)) return
+  if (captures.has(tabId)) {
+    pendingClose.add(tabId)
+    sendToChrome('request-stop', { reason: 'user', skipDialog: false, tabId })
+    return
+  }
+  destroyTab(tabId)
+}
+
+function installDownloads() {
+  browserSession.on('will-download', (_event, item, contents) => {
+    fs.mkdirSync(downloadDir, { recursive: true })
+    const tab = contents ? tabByContents(contents) : null
+    let host = 'page'
+    try {
+      host = new URL(contents && contents.getURL()).hostname || host
+    } catch {}
+    const savePath = uniquePath(path.join(downloadDir, `${Date.now()}_${safeFileName(host)}_${safeFileName(item.getFilename())}`))
+    item.setSavePath(savePath)
+    const tabId = tab ? tab.id : null
+    sendToChrome('download-update', { tabId, state: 'progress', fileName: path.basename(savePath) })
+    item.once('done', (_doneEvent, state) => {
+      if (state === 'completed' && tab) {
+        tab.lastDownload = savePath
+        sendTabs()
+      }
+      sendToChrome('download-update', { tabId, state, fileName: path.basename(savePath) })
+    })
+  })
+}
+
+function resolveRecordingTest(result) {
+  if (!recordingFinished || !recordingFinished.resolve) return
+  const resolve = recordingFinished.resolve
+  recordingFinished.resolve = null
+  resolve(result)
+}
+
 function attachIpc() {
   ipcMain.handle('get-settings', () => loadSettings())
   ipcMain.handle('set-silence-stop', (_event, enabled) => {
     saveSettings({ silenceStop: !!enabled })
     return { ok: true }
   })
-  ipcMain.handle('set-output-muted', (_event, muted) => {
-    outputMuted = !!muted
+  ipcMain.handle('set-output-muted', (_event, muted, tabId) => {
+    const tab = tabs.get(Number(tabId)) || activeTab()
+    if (!tab) return { ok: false }
+    tab.muted = !!muted
+    outputMuted = tab.muted
     if (!SELF_TEST) saveSettings({ outputMuted })
-    applyOutputMute()
+    applyTabMute(tab)
+    sendTabs()
     return { ok: true }
   })
   ipcMain.handle('open-folder', async () => {
     const error = await shell.openPath(captureDir)
     return error ? { ok: false, error } : { ok: true }
   })
+  ipcMain.handle('open-download', async (_event, tabId) => {
+    const tab = tabs.get(Number(tabId)) || activeTab()
+    if (tab && tab.lastDownload && fs.existsSync(tab.lastDownload)) {
+      shell.showItemInFolder(tab.lastDownload)
+      return { ok: true }
+    }
+    fs.mkdirSync(downloadDir, { recursive: true })
+    const error = await shell.openPath(downloadDir)
+    return error ? { ok: false, error } : { ok: true }
+  })
+  ipcMain.handle('new-tab', async () => {
+    await createTab({ blank: true })
+    return { ok: true }
+  })
+  ipcMain.handle('select-tab', (_event, tabId) => {
+    selectTab(Number(tabId))
+    return { ok: true }
+  })
+  ipcMain.handle('close-tab', (_event, tabId) => {
+    requestClose(Number(tabId))
+    return { ok: true }
+  })
   ipcMain.handle('navigate', async (_event, input) => {
+    const tab = activeTab()
     const url = normalizeAddress(input)
-    if (!url || !browserView) return { ok: false }
+    if (!url || !tab) return { ok: false }
     try {
-      await browserView.webContents.loadURL(url)
+      await tab.view.webContents.loadURL(url)
       return { ok: true }
     } catch (error) {
       return { ok: false, error: error.message }
     }
   })
   ipcMain.handle('back', () => {
-    const history = browserView && browserView.webContents.navigationHistory
+    const history = activeTab() && activeTab().view.webContents.navigationHistory
     if (history && history.canGoBack()) history.goBack()
   })
   ipcMain.handle('forward', () => {
-    const history = browserView && browserView.webContents.navigationHistory
+    const history = activeTab() && activeTab().view.webContents.navigationHistory
     if (history && history.canGoForward()) history.goForward()
   })
   ipcMain.handle('reload', () => {
-    if (!browserView) return
-    const contents = browserView.webContents
+    const tab = activeTab()
+    if (!tab) return
+    const contents = tab.view.webContents
     if (contents.isLoading()) contents.stop()
     else contents.reload()
   })
+  ipcMain.on('prepare-capture', (event, tabId) => {
+    const id = Number(tabId)
+    if (tabs.has(id)) captureQueue.push(id)
+    event.returnValue = true
+  })
+  ipcMain.on('cancel-capture', (event, tabId) => {
+    const id = Number(tabId)
+    const index = captureQueue.lastIndexOf(id)
+    if (index >= 0) captureQueue.splice(index, 1)
+    event.returnValue = true
+  })
   ipcMain.handle('begin-file', (_event, meta) => {
-    if (capture) return { ok: true }
+    const requestedId = Number(meta && meta.tabId)
+    const tab = Number.isFinite(requestedId) ? tabs.get(requestedId) : activeTab()
+    if (!tab) return { ok: false, error: 'No tab to record.' }
+    if (captures.has(tab.id)) return { ok: true }
     try {
       fs.mkdirSync(captureDir, { recursive: true })
       const channels = Math.max(1, Math.min(8, Number(meta && meta.channels) || 2))
       const sampleRate = Math.max(8000, Math.min(192000, Number(meta && meta.sampleRate) || 48000))
-      const pageUrl = browserView.webContents.getURL()
+      const pageUrl = tab.view.webContents.getURL()
       const wavPath = uniquePath(path.join(captureDir, fileNameFor(pageUrl)))
-      const floatPath = path.join(captureDir, `.recording-${Date.now()}.f32`)
-      capture = {
+      const floatPath = path.join(captureDir, `.recording-${tab.id}-${Date.now()}.f32`)
+      captures.set(tab.id, {
+        tabId: tab.id,
         floatCapture: wav.createFloatCapture(floatPath),
         floatPath,
         wavPath,
         sampleRate,
         channels,
         pageUrl,
-      }
-      recordingFinished = {}
-      recordingFinished.promise = new Promise((resolve) => {
-        recordingFinished.resolve = resolve
       })
+      if (!recordingFinished) {
+        recordingFinished = {}
+        recordingFinished.promise = new Promise((resolve) => {
+          recordingFinished.resolve = resolve
+        })
+      }
       if (SELF_TEST) {
         setTimeout(() => {
-          if (capture && chromeView && !chromeView.webContents.isDestroyed()) {
-            chromeView.webContents.send('request-stop', { reason: 'user', skipDialog: true })
+          if (captures.has(tab.id) && chromeView && !chromeView.webContents.isDestroyed()) {
+            chromeView.webContents.send('request-stop', { reason: 'user', skipDialog: true, tabId: tab.id })
           }
         }, 2500)
       }
+      sendTabs()
       return { ok: true }
     } catch (error) {
       console.error(error)
@@ -305,17 +558,19 @@ function attachIpc() {
     }
   })
 
-  ipcMain.on('audio-chunk', (_event, payload) => {
-    if (!capture) return
+  ipcMain.on('audio-chunk', (_event, tabId, payload) => {
+    const current = captures.get(Number(tabId))
+    if (!current) return
     const buffer = asBuffer(payload)
-    const frameBytes = capture.channels * 4
+    const frameBytes = current.channels * 4
     if (buffer.length < frameBytes || buffer.length % frameBytes !== 0) return
-    capture.floatCapture.append(buffer)
+    current.floatCapture.append(buffer)
   })
 
-  ipcMain.handle('end-file', async (_event, info) => {
-    const current = capture
-    capture = null
+  ipcMain.handle('end-file', async (_event, tabId, info) => {
+    const id = Number(tabId)
+    const current = captures.get(id)
+    captures.delete(id)
     if (!current) return { ok: false, error: 'Nothing was recorded.' }
     const reason = info && info.reason
     const skipDialog = SELF_TEST || !!(info && info.skipDialog) || reason === 'quit'
@@ -326,7 +581,7 @@ function attachIpc() {
       if (totalFrames <= 0) {
         fs.rmSync(current.floatPath, { force: true })
         const empty = { ok: false, error: 'Nothing was recorded.', selfTestRms: 0 }
-        if (recordingFinished) recordingFinished.resolve(empty)
+        resolveRecordingTest(empty)
         return empty
       }
 
@@ -377,36 +632,39 @@ function attachIpc() {
 
       const level = wav.rms(current.floatPath, current.channels)
       fs.rmSync(current.floatPath, { force: true })
+      const tab = tabs.get(id)
+      if (tab) tab.lastRecording = current.wavPath
       const result = {
         ok: true,
         trimmed,
         note,
+        tabId: id,
         filePath: current.wavPath,
         fileName: path.basename(current.wavPath),
-        durationSeconds: trimmed ? undefined : durationSeconds,
+        durationSeconds,
         sampleRate: current.sampleRate,
         channels: current.channels,
         rms: level,
+        selfTestRms: level,
       }
       if (trimmed) {
         const header = fs.statSync(current.wavPath)
         const dataBytes = Math.max(0, header.size - 44)
         result.durationSeconds = dataBytes / (current.sampleRate * current.channels * 3)
-      } else {
-        result.durationSeconds = durationSeconds
       }
-      result.selfTestRms = level
       console.log('RECORDING_RMS', level.toFixed(5))
-      if (recordingFinished) recordingFinished.resolve(result)
+      resolveRecordingTest(result)
+      sendTabs()
       return result
     } catch (error) {
       console.error(error)
       try { fs.rmSync(current.floatPath, { force: true }) } catch {}
       const failed = { ok: false, error: error.message }
-      if (recordingFinished) recordingFinished.resolve(failed)
+      resolveRecordingTest(failed)
       return failed
     } finally {
-      if (closeAfterSave && win && !win.isDestroyed()) {
+      if (pendingClose.has(id) && !captures.has(id)) destroyTab(id)
+      if (closeAfterSave && captures.size === 0 && win && !win.isDestroyed()) {
         closeAfterSave = false
         setImmediate(() => {
           if (win && !win.isDestroyed()) win.close()
@@ -423,8 +681,10 @@ function rememberUrl(url) {
 
 async function createMainWindow() {
   captureDir = captureDirectory()
+  downloadDir = downloadDirectory()
   settingsPath = path.join(app.getPath('userData'), 'settings.json')
   fs.mkdirSync(captureDir, { recursive: true })
+  fs.mkdirSync(downloadDir, { recursive: true })
   cleanupTemps()
 
   outputMuted = loadSettings().outputMuted === true
@@ -453,12 +713,14 @@ async function createMainWindow() {
   })
   session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
     if (SELF_TEST) console.log('DISPLAY_MEDIA', request.videoRequested, request.audioRequested)
-    const frame = browserFrame()
+    const queuedId = captureQueue.shift()
+    const tab = tabs.get(queuedId) || activeTab()
+    const frame = browserFrameFor(tab)
     if (!frame) {
       callback({})
       return
     }
-    const streams = { audio: frame, enableLocalEcho: true }
+    const streams = { audio: frame, enableLocalEcho: !tab.muted }
     if (request.videoRequested) streams.video = frame
     callback(streams)
   }, { useSystemPicker: false })
@@ -483,91 +745,49 @@ async function createMainWindow() {
       sandbox: true,
     },
   })
-  browserView = new WebContentsView({
-    webPreferences: {
-      partition: PARTITION,
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
-  })
   chromeView.setBackgroundColor('#1a1e27')
-  browserView.setBackgroundColor('#12141a')
   win.contentView.addChildView(chromeView)
-  win.contentView.addChildView(browserView)
-
-  const browserContents = browserView.webContents
-  browserContents.setBackgroundThrottling(false)
-  browserContents.on('did-start-loading', sendNav)
-  browserContents.on('did-stop-loading', sendNav)
-  browserContents.on('did-navigate', (_event, url) => {
-    rememberUrl(url)
-    sendNav()
-  })
-  browserContents.on('did-navigate-in-page', (_event, url) => {
-    rememberUrl(url)
-    sendNav()
-  })
-  browserContents.on('page-title-updated', (_event, title) => {
-    if (!win.isDestroyed()) {
-      win.setTitle(title ? `${title} — Browser Audio Capture` : 'Browser Audio Capture')
-    }
-  })
-
   chromeView.webContents.on('page-title-updated', (event) => event.preventDefault())
   chromeView.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown') return
-    if (input.control && input.key.toLowerCase() === 'l') {
+    const key = String(input.key || '').toLowerCase()
+    if (input.control && key === 'l') {
       event.preventDefault()
       chromeView.webContents.send('focus-url')
+    } else if (input.control && key === 't' && !input.shift) {
+      event.preventDefault()
+      void createTab({ blank: true })
+    } else if (input.control && key === 'w') {
+      event.preventDefault()
+      if (activeTabId) requestClose(activeTabId)
+    } else if (input.control && input.key === 'Tab') {
+      event.preventDefault()
+      cycleTab(input.shift ? -1 : 1)
     }
   })
-  browserContents.on('before-input-event', (event, input) => {
-    if (input.type !== 'keyDown') return
-    if (input.alt && input.key === 'Left') {
-      event.preventDefault()
-      if (browserContents.navigationHistory.canGoBack()) browserContents.navigationHistory.goBack()
-    } else if (input.alt && input.key === 'Right') {
-      event.preventDefault()
-      if (browserContents.navigationHistory.canGoForward()) browserContents.navigationHistory.goForward()
-    } else if (input.control && input.key.toLowerCase() === 'l') {
-      event.preventDefault()
-      chromeView.webContents.focus()
-      chromeView.webContents.send('focus-url')
-    } else if (input.key === 'F9') {
-      event.preventDefault()
-      chromeView.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'F9' })
-      chromeView.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'F9' })
-    }
-  })
+
+  installDownloads()
 
   win.on('resize', layout)
   win.on('close', (event) => {
-    if (capture && !closeAfterSave) {
+    if (captures.size > 0 && !closeAfterSave) {
       event.preventDefault()
       closeAfterSave = true
-      chromeView.webContents.send('request-stop', { reason: 'quit', skipDialog: true })
+      chromeView.webContents.send('request-stop', { reason: 'quit', skipDialog: true, all: true })
     }
   })
 
-  const settings = loadSettings()
   const chromeReady = new Promise((resolve) => {
     chromeView.webContents.once('did-finish-load', resolve)
   })
-  const browserReady = new Promise((resolve) => {
-    browserContents.once('did-finish-load', resolve)
-  })
-
+  const tab = await createTab(SELF_TEST ? { file: path.join(__dirname, 'src', 'test-tone.html') } : {})
+  browserView = tab.view
   await chromeView.webContents.loadURL('app://local/index.html')
-  if (SELF_TEST) await browserContents.loadFile(path.join(__dirname, 'src', 'test-tone.html'))
-  else if (/^https?:\/\//i.test(settings.lastUrl)) await browserContents.loadURL(settings.lastUrl)
-  else await browserContents.loadFile(path.join(__dirname, 'src', 'start.html'))
-
   await chromeReady
-  await browserReady
   layout()
   win.show()
-  sendNav()
+  layout()
+  sendTabs()
 }
 
 function delay(ms) {
@@ -598,6 +818,15 @@ async function runSelfTest() {
     chromeView.webContents.on('console-message', (details) => {
       console.log('CHROME:', details.message)
     })
+
+    const readyAt = Date.now()
+    let tabCount = 0
+    while (Date.now() - readyAt < 4000) {
+      tabCount = await chromeView.webContents.executeJavaScript('document.querySelectorAll(".tab").length')
+      if (tabCount > 0) break
+      await delay(50)
+    }
+    if (!tabCount) failures.push('tabs did not render')
 
     if (process.argv.includes('--self-test-mute')) {
       const muteRect = await chromeView.webContents.executeJavaScript(`(() => {

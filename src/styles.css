@@ -13,7 +13,7 @@
 
 html, body {
   margin: 0;
-  height: 104px;
+  height: 136px;
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
@@ -22,11 +22,11 @@ html, body {
 }
 
 .chrome {
-  height: 104px;
-  padding: 10px 10px 8px;
+  height: 136px;
+  padding: 8px 10px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -36,6 +36,77 @@ html, body {
   gap: 8px;
   height: 36px;
   min-width: 0;
+}
+
+.tabs-row { height: 32px; }
+
+.tabs {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  min-width: 96px;
+  height: 28px;
+  padding: 0 4px 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #12151c;
+  color: var(--text);
+  flex: 0 1 180px;
+}
+
+.tab.active {
+  background: #0e1116;
+  border-color: #3d4a63;
+}
+
+.tab-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 0;
+  cursor: pointer;
+}
+
+.tab-rec, .tab-down, .tab-close {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  padding: 0;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.tab.recording .tab-rec { color: var(--accent); }
+.tab-down:disabled { opacity: 0.3; cursor: default; }
+.tab-close:hover, .tab-rec:hover, .tab-down:hover { color: var(--text); }
+
+#new-tab {
+  width: 32px;
+  height: 28px;
+  flex: 0 0 32px;
 }
 
 .icon-btn, .text-btn, #record {
