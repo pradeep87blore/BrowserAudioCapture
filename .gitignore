@@ -1,0 +1,5 @@
+node_modules/
+captured/*.wav
+captured/*.f32
+captured/.selftest-*
+dist/

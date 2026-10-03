@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Start</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #12141a;
+      color: #d7dbe4;
+      font: 16px/1.5 "Segoe UI", sans-serif;
+      display: grid;
+      place-items: center;
+    }
+    main { max-width: 640px; padding: 32px; }
+    h1 {
+      font-size: 28px;
+      font-weight: 650;
+      letter-spacing: -0.03em;
+      margin: 0 0 12px;
+    }
+    ol { margin: 0; padding-left: 20px; }
+    li { margin: 10px 0; }
+    .note { color: #9aa3b5; font-size: 14px; margin: 18px 0 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Browser Audio Capture</h1>
+    <ol>
+      <li>Enter a site in the address bar and log in. This browser keeps its own cookies, so the login stays after you close the app or restart the PC, for as long as the site keeps the login valid.</li>
+      <li>Play the audio, then press Record. The take is saved in the <b>captured</b> folder as a 48 kHz, 24-bit WAV. The speaker button mutes this browser so you can listen to something else. Recording still captures the page.</li>
+      <li>When recording stops, you can trim silence from the beginning and the end. Turn on the switch if a full minute of silence should stop the recording for you.</li>
+    </ol>
+    <p class="note">Some sites block capture of protected audio. If a recording is silent while you can still hear the page, that site is not allowing the audio to be read.</p>
+  </main>
+</body>
+</html>

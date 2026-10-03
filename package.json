@@ -1,0 +1,15 @@
+{
+  "name": "browser-audio-capture",
+  "productName": "Browser Audio Capture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Built-in browser that records page audio to WAV files.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node scripts/check-wav.js && electron . --self-test && electron . --self-test-cookies"
+  },
+  "devDependencies": {
+    "electron": "^44.5.1"
+  }
+}
