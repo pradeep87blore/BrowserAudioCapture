@@ -54,6 +54,11 @@ function sessionFor(tabId) {
       workletNode: null,
       sourceNode: null,
       sinkNode: null,
+      reader: null,
+      pump: null,
+      batcher: null,
+      nextUs: null,
+      failure: '',
       channels: 2,
       sampleRate: 48000,
       recordedFrames: 0,
@@ -176,6 +181,107 @@ async function captureStream(tabId) {
   throw lastError || new Error('Could not capture browser audio.')
 }
 
+function createBatcher(session) {
+  let parts = []
+  let frames = 0
+  let channels = 0
+  return {
+    push(samples, channelCount) {
+      if (!samples || samples.length === 0 || !channelCount) return
+      if (!channels) channels = channelCount
+      if (channelCount !== channels) return
+      parts.push(samples)
+      frames += samples.length / channels
+      if (frames >= Math.round((session.sampleRate || 48000) * 0.1)) this.flush()
+    },
+    flush() {
+      if (!frames || !channels) {
+        parts = []
+        frames = 0
+        return
+      }
+      let merged = parts[0]
+      if (parts.length > 1) {
+        merged = new Float32Array(frames * channels)
+        let offset = 0
+        for (const part of parts) {
+          merged.set(part, offset)
+          offset += part.length
+        }
+      }
+      parts = []
+      frames = 0
+      enqueueChunk(session, { channels, samples: merged })
+    },
+  }
+}
+
+function copyAudioData(audioData) {
+  const channels = audioData.numberOfChannels || 1
+  const frames = audioData.numberOfFrames || 0
+  if (!frames) return null
+  const samples = new Float32Array(frames * channels)
+  try {
+    audioData.copyTo(samples, { planeIndex: 0, format: 'f32' })
+  } catch {
+    for (let c = 0; c < channels; c++) {
+      const plane = new Float32Array(frames)
+      audioData.copyTo(plane, { planeIndex: c, format: 'f32-planar' })
+      for (let i = 0; i < frames; i++) samples[i * channels + c] = plane[i]
+    }
+  }
+  return { samples, channels, frames, sampleRate: audioData.sampleRate, timestamp: Number(audioData.timestamp) }
+}
+
+function appendAudioData(session, batcher, audioData) {
+  const copied = copyAudioData(audioData)
+  if (!copied || !copied.frames || !copied.sampleRate) return
+  const rate = copied.sampleRate
+  if (!session.rateSet) {
+    session.sampleRate = rate
+    session.rateSet = true
+  }
+  const durationUs = (copied.frames / rate) * 1e6
+  const timestamp = copied.timestamp
+  if (session.nextUs != null && Number.isFinite(timestamp)) {
+    const gapFrames = Math.round((timestamp - session.nextUs) * rate / 1e6)
+    const minGap = Math.round(rate * 0.02)
+    const maxGap = Math.round(rate * 5)
+    if (gapFrames >= minGap && gapFrames <= maxGap) {
+      batcher.push(new Float32Array(gapFrames * copied.channels), copied.channels)
+    }
+  }
+  if (Number.isFinite(timestamp)) session.nextUs = timestamp + durationUs
+  batcher.push(copied.samples, copied.channels)
+}
+
+// The page's audio has its own clock. Reading that track directly keeps a long
+// recording from drifting against the speaker device and skipping.
+async function readTrack(session, track) {
+  const processor = new MediaStreamTrackProcessor({ track, maxBufferSize: 8000 })
+  const reader = processor.readable.getReader()
+  session.reader = reader
+  const batcher = createBatcher(session)
+  session.batcher = batcher
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      try {
+        if (session.state === 'idle') break
+        appendAudioData(session, batcher, value)
+      } finally {
+        value.close()
+      }
+    }
+  } finally {
+    batcher.flush()
+    session.reader = null
+    try { reader.releaseLock() } catch {}
+  }
+}
+
 function teardownAudio(session) {
   try { session.sourceNode && session.sourceNode.disconnect() } catch {}
   try { session.workletNode && session.workletNode.disconnect() } catch {}
@@ -213,7 +319,7 @@ async function processChunk(session, data) {
   const rms = Math.sqrt(sum / Math.max(1, data.samples.length))
   const db = 20 * Math.log10(rms + 1e-8)
   session.meter = Math.max(0, Math.min(1, (db + 60) / 60))
-  window.capture.writeChunk(session.tabId, data.samples)
+  await window.capture.writeChunk(session.tabId, data.samples)
   const frames = data.samples.length / chunkChannels
   session.recordedFrames += frames
   if (rms < SILENCE_RMS) session.silentFrames += frames
@@ -255,30 +361,37 @@ async function startRecording(session) {
   session.writeChain = Promise.resolve()
   session.timer = '0:00'
   session.meter = 0
+  session.nextUs = null
+  session.failure = ''
+  session.rateSet = false
+  session.reader = null
+  session.pump = null
+  session.batcher = null
   setStatus(session, 'Starting…')
 
   try {
-    session.audioContext = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' })
-    const resumed = session.audioContext.resume()
+    if (typeof MediaStreamTrackProcessor !== 'function') {
+      throw new Error('This browser cannot read page audio directly.')
+    }
     session.mediaStream = await captureStream(session.tabId)
-    await resumed
-    if (session.audioContext.state === 'suspended') await session.audioContext.resume()
-    session.sampleRate = session.audioContext.sampleRate
+    if (session.state !== 'starting') {
+      await teardownAudio(session)
+      return
+    }
     const track = session.mediaStream.getAudioTracks()[0]
-    track.addEventListener('ended', () => {
-      if (session.state === 'recording') void stopRecording(session, { reason: 'ended' })
-    })
-    await session.audioContext.audioWorklet.addModule(new URL('recorder-worklet.js', window.location.href).href)
-    session.workletNode = new AudioWorkletNode(session.audioContext, 'recorder-processor')
-    session.workletNode.port.onmessage = (event) => enqueueChunk(session, event.data || {})
-    session.sourceNode = session.audioContext.createMediaStreamSource(session.mediaStream)
-    session.sinkNode = session.audioContext.createGain()
-    session.sinkNode.gain.value = 0
-    session.sourceNode.connect(session.workletNode)
-    session.workletNode.connect(session.sinkNode)
-    session.sinkNode.connect(session.audioContext.destination)
     markState(session, 'recording')
     setStatus(session, 'Recording', 'recording')
+    const reading = readTrack(session, track)
+    session.pump = reading
+    reading.then(() => {
+      if (session.state === 'recording') void stopRecording(session, { reason: 'ended' })
+    }, (error) => {
+      console.error(error)
+      session.failure = error.message || 'Recording interrupted.'
+      if (session.state === 'recording' || session.state === 'starting') {
+        void stopRecording(session, { reason: 'ended' })
+      }
+    })
   } catch (error) {
     console.error(error)
     window.capture.cancelCapture(session.tabId)
@@ -303,25 +416,13 @@ async function finishRecording(session, options) {
   markState(session, 'stopping')
   setStatus(session, 'Saving…')
   try {
-    try { session.sourceNode && session.sourceNode.disconnect() } catch {}
-    if (session.workletNode) {
-      let flushDone = false
-      const node = session.workletNode
-      const flushed = new Promise((resolve) => {
-        node.port.onmessage = (event) => {
-          enqueueChunk(session, event.data || {})
-          if (event.data && event.data.flush) {
-            flushDone = true
-            resolve()
-          }
-        }
-        node.port.postMessage({ command: 'flush' })
-        setTimeout(() => {
-          if (!flushDone) resolve()
-        }, 500)
-      })
-      await flushed
+    if (session.reader && reason !== 'ended') {
+      try { await session.reader.cancel() } catch {}
     }
+    if (session.pump) {
+      try { await session.pump } catch (error) { console.error(error) }
+    }
+    if (session.batcher) session.batcher.flush()
     await session.writeChain
     await delay(50)
     await session.writeChain
@@ -332,7 +433,7 @@ async function finishRecording(session, options) {
     })
     session.timer = formatDuration(result.durationSeconds || 0)
     session.meter = 0
-    if (!result.ok) setStatus(session, result.error || 'Recording failed.', 'error')
+    if (!result.ok) setStatus(session, session.failure || result.error || 'Recording failed.', 'error')
     else if (result.trimmed) setStatus(session, `Trimmed and saved ${result.fileName}`)
     else if (result.note) setStatus(session, `Saved ${result.fileName}. ${result.note}`)
     else setStatus(session, `Saved ${result.fileName}`)

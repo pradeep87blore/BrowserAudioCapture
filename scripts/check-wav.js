@@ -25,10 +25,11 @@ function pushSeconds(seconds, fill) {
   capture.append(Buffer.from(samples.buffer))
 }
 
+async function main() {
 pushSeconds(1, () => 0)
 pushSeconds(1, (t) => Math.sin(2 * Math.PI * 440 * t) * 0.2)
 pushSeconds(1, () => 0)
-capture.close()
+await capture.close()
 
 const range = wav.findAudibleRange(floatPath, { channels, sampleRate, padSeconds: 0.12 })
 assert(!range.allSilent, 'expected the tone to be audible')
@@ -39,7 +40,7 @@ assert(Math.abs(range.endFrame - (sampleRate * 2 + pad)) < sampleRate * 0.02, 't
 const silentPath = path.join(dir, 'silent.f32')
 const silent = wav.createFloatCapture(silentPath)
 silent.append(Buffer.alloc(sampleRate * channels * 4))
-silent.close()
+await silent.close()
 const silentRange = wav.findAudibleRange(silentPath, { channels, sampleRate })
 assert(silentRange.allSilent, 'expected all-silent file')
 
@@ -64,3 +65,9 @@ assert(fullRms > 0.02, 'rms too low: ' + fullRms)
 
 fs.rmSync(dir, { recursive: true, force: true })
 console.log('WAV checks passed')
+}
+
+main().catch((error) => {
+  console.error(error)
+  process.exit(1)
+})

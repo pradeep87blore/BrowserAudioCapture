@@ -6,7 +6,7 @@ contextBridge.exposeInMainWorld('capture', {
   beginFile: (meta) => ipcRenderer.invoke('begin-file', meta),
   writeChunk: (tabId, samples) => {
     const bytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength)
-    ipcRenderer.send('audio-chunk', tabId, bytes)
+    return ipcRenderer.invoke('audio-chunk', tabId, bytes)
   },
   endFile: (tabId, info) => ipcRenderer.invoke('end-file', tabId, info),
   getSettings: () => ipcRenderer.invoke('get-settings'),

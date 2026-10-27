@@ -558,13 +558,14 @@ function attachIpc() {
     }
   })
 
-  ipcMain.on('audio-chunk', (_event, tabId, payload) => {
+  ipcMain.handle('audio-chunk', (_event, tabId, payload) => {
     const current = captures.get(Number(tabId))
-    if (!current) return
+    if (!current) return { ok: false }
     const buffer = asBuffer(payload)
     const frameBytes = current.channels * 4
-    if (buffer.length < frameBytes || buffer.length % frameBytes !== 0) return
+    if (buffer.length < frameBytes || buffer.length % frameBytes !== 0) return { ok: false }
     current.floatCapture.append(buffer)
+    return { ok: true }
   })
 
   ipcMain.handle('end-file', async (_event, tabId, info) => {
@@ -575,7 +576,7 @@ function attachIpc() {
     const reason = info && info.reason
     const skipDialog = SELF_TEST || !!(info && info.skipDialog) || reason === 'quit'
     try {
-      current.floatCapture.close()
+      await current.floatCapture.close()
       const totalFrames = wav.frameCount(current.floatPath, current.channels)
       const durationSeconds = totalFrames / current.sampleRate
       if (totalFrames <= 0) {
